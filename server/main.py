@@ -1,10 +1,12 @@
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import uvicorn
 from dotenv import load_dotenv
 import os
+import asyncio
+
 
 load_dotenv()
 
@@ -25,6 +27,81 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# websocket parts
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: Dict[str, List[WebSocket]] = {}
+        
+    async def connect(self, websocket: WebSocket, route_id: str):
+        await websocket.accept()
+        if route_id not in self.active_connections:
+            self.active_connections[route_id] = []
+        self.active_connections[route_id].append(websocket)  
+        
+    async def disconnect(self, websocket: WebSocket, route_id: str):
+        if route_id in self.active_connections:
+            # you cant use del here because, well imagine an adjacency list
+            # you cant delete the nodes just because you wanna delete one neighbour
+            self.active_connections[route_id].remove(websocket)
+            if not self.active_connections[route_id]: #i.e if there are no websockets attached to this route_id (no neighbours for this node)
+                del self.active_connections[route_id]
+
+    async def broadcast_to_route(self, route_id: str, message: dict):
+        if route_id in self.active_connections:
+            for connection in self.active_connections[route_id]:
+                await connection.send_json(message)
+                
+manager = ConnectionManager();
+
+@app.websocket("/ws/routes/{route_id}")
+async def route_telemetry(websocket: WebSocket, route_id: str):
+    # gives route telemetry of all the busses in that route
+    await manager.connect(websocket, route_id)
+    mock_waypoints = [
+        {"lat": 12.9767, "lng": 77.5713, "stop": "Majestic"},
+        {"lat": 12.9918, "lng": 77.5712, "stop": "Sampige Road"},
+        {"lat": 13.0012, "lng": 77.5641, "stop": "Malleshwaram 18th Cross"},
+        {"lat": 13.0183, "lng": 77.5548, "stop": "Yeshwanthpur TTMC"},
+    ]
+    
+    # Track multiple active buses on this route with staggered starting waypoint indexes
+    active_buses = [
+        {"bus_id": f"KA-01-F-{route_id[:4].upper()}-01", "step": 0},
+        {"bus_id": f"KA-01-F-{route_id[:4].upper()}-02", "step": 2},
+    ]
+    
+    try:
+        while True:
+            fleet_telemetry = []
+            
+            # simulate busses
+            for bus in active_buses:
+                current_pos = mock_waypoints[bus["step"] % len(mock_waypoints)]
+                fleet_telemetry.append({
+                    "bus_id": bus["bus_id"],
+                    "latitude": current_pos["lat"],
+                    "longitude": current_pos["lng"],
+                    "next_stop": current_pos["stop"],
+                    "eta_mins": max(1, 12 - (bus["step"] * 2) % 12),
+                    "available_seats": max(0, 30 - (bus["step"] * 5) % 30)
+                })
+                # Advance bus position
+                bus["step"] += 1
+                
+            await websocket.send_json(
+                {
+                    "event": "FLEET_LOCATION_UPDATE",
+                    "route_id": route_id,
+                    "buses": fleet_telemetry
+                }
+            )
+            
+            await asyncio.sleep(5)
+            
+    except WebSocketDisconnect:
+        manager.disconnect(websocket, route_id)
+        print(f'Disconnected {route_id} from websocket: {websocket}')
+    
 
 @app.get("/api/v1/routes/search")
 async def search_routes(

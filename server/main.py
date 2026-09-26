@@ -163,31 +163,176 @@ async def search_routes(
                         })
 
     # -----------------------------------------------------------------
-    # MODE 2: MULTI-LEG ROUTES (Transfer / Waypointed options)
+    # MODE 2: MULTI-LEG ROUTES (Real transfer search — no hardcoding)
     # -----------------------------------------------------------------
-    # Sample multi-leg mock response structure for search preview
-    multiple_leg_routes.append({
-        "id": "multi-1",
-        "transfer_stop": waypoint_name if waypoint_name else "Yeshwanthpur TTMC",
-        "legs": [
-            {
-                "from": start_name,
-                "to": waypoint_name if waypoint_name else "Yeshwanthpur TTMC",
-                "route_no": "252C",
-                "current_stop_summary": "at stop A-2 now",
-                "eta_mins": 5,
-                "is_at_start": False
-            },
-            {
-                "from": waypoint_name if waypoint_name else "Yeshwanthpur TTMC",
-                "to": dest_name,
-                "route_no": "185",
-                "current_stop_summary": "at stop B-1 now",
-                "eta_mins": 12,
-                "is_at_start": False
-            }
-        ]
-    })
+    # Algorithm: 4 bulk Supabase queries, then set-intersection in Python.
+    #
+    # Step A: Find every (route_id, stop_id, sequence) reachable FROM start_id.
+    #         i.e. all route_stops rows where route_id passes through start_id,
+    #         and the stop's sequence is AFTER start_id's sequence on that route.
+    #         These are the "forward reachable" stops from the origin.
+    #
+    # Step B: Find every (route_id, stop_id, sequence) that can REACH dest_id.
+    #         i.e. all route_stops rows where route_id passes through dest_id,
+    #         and the stop's sequence is BEFORE dest_id's sequence on that route.
+    #         These are the "backward reachable" stops into the destination.
+    #
+    # Step C: Intersect on stop_id → these are valid transfer stops.
+    #         For each transfer stop, pair every (leg1_route, leg2_route) combo.
+    #
+    # If a waypoint was provided, we only consider that stop as the transfer.
+
+    # --- STEP A: stops reachable forward from start_id ---
+    # Fetch all route_stops entries for routes that serve start_id
+    routes_from_start = supabase.table("route_stops") \
+        .select("route_id, sequence") \
+        .eq("stop_id", start_id) \
+        .execute()
+
+    # Build a map: route_id -> start_sequence (the sequence of start_id on that route)
+    start_seq_by_route: Dict[str, int] = {
+        row["route_id"]: row["sequence"] for row in (routes_from_start.data or [])
+    }
+
+    # For each of those routes, fetch all stops that come AFTER start_id
+    forward_reachable: Dict[str, List[dict]] = {}  # stop_id -> list of {route_id, route_no, route_type, sequence}
+
+    if start_seq_by_route:
+        route_ids_from_start = list(start_seq_by_route.keys())
+
+        # Bulk fetch all stops on all origin routes in one query
+        all_stops_on_origin_routes = supabase.table("route_stops") \
+            .select("route_id, stop_id, sequence") \
+            .in_("route_id", route_ids_from_start) \
+            .execute()
+
+        # Fetch route metadata for origin routes in bulk
+        origin_route_info_resp = supabase.table("bmtc_routes") \
+            .select("id, route_no, route_type") \
+            .in_("id", route_ids_from_start) \
+            .execute()
+        origin_route_info: Dict[str, dict] = {
+            r["id"]: r for r in (origin_route_info_resp.data or [])
+        }
+
+        for row in (all_stops_on_origin_routes.data or []):
+            r_id = row["route_id"]
+            # Only keep stops that come AFTER start_id on this route
+            if row["sequence"] > start_seq_by_route[r_id] and row["stop_id"] != dest_id:
+                stop_id = row["stop_id"]
+                if stop_id not in forward_reachable:
+                    forward_reachable[stop_id] = []
+                if r_id in origin_route_info:
+                    forward_reachable[stop_id].append({
+                        "route_id": r_id,
+                        "route_no": origin_route_info[r_id]["route_no"],
+                        "route_type": origin_route_info[r_id]["route_type"],
+                        "sequence": row["sequence"]
+                    })
+
+    # --- STEP B: stops that can reach dest_id ---
+    routes_to_dest = supabase.table("route_stops") \
+        .select("route_id, sequence") \
+        .eq("stop_id", dest_id) \
+        .execute()
+
+    dest_seq_by_route: Dict[str, int] = {
+        row["route_id"]: row["sequence"] for row in (routes_to_dest.data or [])
+    }
+
+    backward_reachable: Dict[str, List[dict]] = {}  # stop_id -> list of {route_id, route_no, route_type, sequence}
+
+    if dest_seq_by_route:
+        route_ids_to_dest = list(dest_seq_by_route.keys())
+
+        all_stops_on_dest_routes = supabase.table("route_stops") \
+            .select("route_id, stop_id, sequence") \
+            .in_("route_id", route_ids_to_dest) \
+            .execute()
+
+        dest_route_info_resp = supabase.table("bmtc_routes") \
+            .select("id, route_no, route_type") \
+            .in_("id", route_ids_to_dest) \
+            .execute()
+        dest_route_info: Dict[str, dict] = {
+            r["id"]: r for r in (dest_route_info_resp.data or [])
+        }
+
+        for row in (all_stops_on_dest_routes.data or []):
+            r_id = row["route_id"]
+            # Only keep stops that come BEFORE dest_id on this route
+            if row["sequence"] < dest_seq_by_route[r_id] and row["stop_id"] != start_id:
+                stop_id = row["stop_id"]
+                if stop_id not in backward_reachable:
+                    backward_reachable[stop_id] = []
+                if r_id in dest_route_info:
+                    backward_reachable[stop_id].append({
+                        "route_id": r_id,
+                        "route_no": dest_route_info[r_id]["route_no"],
+                        "route_type": dest_route_info[r_id]["route_type"],
+                        "sequence": row["sequence"]
+                    })
+
+    # --- STEP C: Intersect to find valid transfer stops ---
+    # If a waypoint was given, restrict to only that stop
+    if waypoint_id:
+        candidate_transfer_stop_ids = {waypoint_id} if waypoint_id in forward_reachable and waypoint_id in backward_reachable else set()
+    else:
+        candidate_transfer_stop_ids = set(forward_reachable.keys()) & set(backward_reachable.keys())
+
+    # Fetch stop names for all transfer candidates in one bulk query
+    transfer_stop_names: Dict[str, str] = {}
+    if candidate_transfer_stop_ids:
+        transfer_stops_resp = supabase.table("bus_stops") \
+            .select("id, name") \
+            .in_("id", list(candidate_transfer_stop_ids)) \
+            .execute()
+        transfer_stop_names = {
+            row["id"]: row["name"] for row in (transfer_stops_resp.data or [])
+        }
+
+    # Build multi-leg results — cap at 5 to avoid overwhelming the response
+    seen_route_pairs: set = set()
+    for transfer_stop_id in list(candidate_transfer_stop_ids)[:10]:
+        transfer_name = transfer_stop_names.get(transfer_stop_id, "Unknown Stop")
+        leg1_options = forward_reachable.get(transfer_stop_id, [])
+        leg2_options = backward_reachable.get(transfer_stop_id, [])
+
+        for leg1 in leg1_options:
+            for leg2 in leg2_options:
+                # Deduplicate: same (leg1_route, leg2_route, transfer) combo
+                pair_key = (leg1["route_id"], leg2["route_id"], transfer_stop_id)
+                if pair_key in seen_route_pairs:
+                    continue
+                seen_route_pairs.add(pair_key)
+
+                multiple_leg_routes.append({
+                    "id": f"multi-{leg1['route_id']}-{leg2['route_id']}-{transfer_stop_id}",
+                    "transfer_stop": transfer_name,
+                    "legs": [
+                        {
+                            "from": start_name,
+                            "to": transfer_name,
+                            "route_no": leg1["route_no"],
+                            "route_type": leg1["route_type"],
+                            "eta_mins": None,   # real ETA needs live GPS feed
+                            "is_at_start": False
+                        },
+                        {
+                            "from": transfer_name,
+                            "to": dest_name,
+                            "route_no": leg2["route_no"],
+                            "route_type": leg2["route_type"],
+                            "eta_mins": None,
+                            "is_at_start": False
+                        }
+                    ]
+                })
+
+                if len(multiple_leg_routes) >= 5:
+                    break
+            if len(multiple_leg_routes) >= 5:
+                break
 
     return {
         "search_params": {"start": start_name, "waypoint": waypoint_name, "destination": dest_name},

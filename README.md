@@ -1,36 +1,92 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# BMTC Real-Time Transit & Fleet Tracking System
 
-## Getting Started
+A full-stack, high-density transit routing and live fleet tracking platform for BMTC (Route 273C). Built with a "no-frills," terminal-style ledger interface prioritizing performance, real-time data density, and minimal rendering overhead over heavy map visualizers.
 
-First, run the development server:
+---
+
+## 🛠 Tech Stack
+
+* **Backend:** FastAPI (Python 3.12), Supabase (PostgreSQL), `asyncpg`
+* **Frontend:** Next.js (React / TypeScript), Tailwind CSS
+* **Communication:** WebSockets (FastAPI `ConnectionManager` with custom JSON telemetry protocol)
+
+---
+
+## 🚀 Key Features
+
+* **Route Discovery (`/api/v1/routes/search`):** Search direct single-bus routes or multi-leg stop sequences across custom PostgreSQL route schemas.
+* **Live Fleet Telemetry Stream:** WebSocket endpoint (`/ws/routes/{route_id}`) broadcasting dynamic multi-vehicle telemetry to active clients every 3 seconds.
+* **High-Density Ledger UI:** High-contrast, map-free terminal interface rendering live coordinates, approaching stops, dynamic ETAs, and real-time seat availability.
+* **Async Connection Management:** Lifespan-managed WebSocket connection pooling handling concurrent updates without blocking the main event loop.
+
+---
+
+## 💻 Local Development Setup
+
+### 1. Backend Setup (FastAPI)
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+# Navigate to server directory
+cd server
+
+# Create and activate virtual environment
+python -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+
+# Install dependencies
+pip install fastapi uvicorn asyncpg supabase
+
+# Start the development server
+uvicorn main:app --reload --port 8000
+
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+### 2. Frontend Setup (Next.js)
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+```bash
+# Navigate to client directory
+cd client
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+# Install dependencies
+npm install
 
-## Learn More
+# Start the Next.js development server
+npm run dev
 
-To learn more about Next.js, take a look at the following resources:
+```
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+Open [http://localhost:3000](http://localhost:3000) in your browser to test the route search and live telemetry stream.
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+---
 
-## Deploy on Vercel
+## 📡 WebSocket API Specification
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+**Endpoint:** `ws://localhost:8000/ws/routes/{route_id}`
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+**Sample Telemetry Broadcast Payload:**
+
+```json
+{
+  "event": "FLEET_LOCATION_UPDATE",
+  "route_id": "273C",
+  "buses": [
+    {
+      "bus_id": "KA-01-F-273C-01",
+      "latitude": 12.9767,
+      "longitude": 77.5713,
+      "next_stop": "Majestic",
+      "eta_mins": 12,
+      "available_seats": 30
+    },
+    {
+      "bus_id": "KA-01-F-273C-02",
+      "latitude": 13.0012,
+      "longitude": 77.5641,
+      "next_stop": "Malleshwaram 18th Cross",
+      "eta_mins": 8,
+      "available_seats": 15
+    }
+  ]
+}
+
+```
